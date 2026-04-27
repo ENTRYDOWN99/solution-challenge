@@ -8,6 +8,13 @@ A full-stack volunteer-need matching system for NGOs, powered by **Google Gemini
 ![SQLite](https://img.shields.io/badge/SQLite-3-lightblue)
 ![Gemini](https://img.shields.io/badge/Google-Gemini%20AI-orange)
 
+> 🔗 **Repository:** [https://github.com/ENTRYDOWN99/solution-challenge](https://github.com/ENTRYDOWN99/solution-challenge)
+
+```bash
+git clone https://github.com/ENTRYDOWN99/solution-challenge.git
+cd solution-challenge
+```
+
 ---
 
 ## 🏗️ Architecture
