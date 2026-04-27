@@ -71,6 +71,7 @@ services:
     environment:
       FLASK_ENV: development
       PORT: 5001
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
 
   frontend:
     build:

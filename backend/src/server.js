@@ -60,6 +60,7 @@ app.use('/api/matching', require('./routes/matching'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/orgs', require('./routes/orgs'));
 app.use('/api/notifications', require('./routes/notifications'));
+app.use('/api/chat', require('./routes/chat'));
 
 // ==========================================
 // ERROR HANDLING

@@ -8,6 +8,30 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
+# ==========================================
+# GEMINI AI (graceful — disabled if no key)
+# ==========================================
+
+gemini = None
+try:
+    import google.generativeai as genai
+    _GEMINI_KEY = os.environ.get('GEMINI_API_KEY', '')
+    if _GEMINI_KEY:
+        genai.configure(api_key=_GEMINI_KEY)
+        gemini = genai.GenerativeModel('gemini-1.5-flash')
+        print("✅ Gemini AI configured successfully")
+    else:
+        print("⚠️ GEMINI_API_KEY not set — Gemini features disabled")
+except Exception as _e:
+    print(f"⚠️ Gemini SDK not available: {_e}")
+
+# In-memory chat sessions keyed by user_id
+chat_sessions = {}
+
+# ==========================================
+# SPACY + SKLEARN (optional)
+# ==========================================
+
 # Try to load spaCy model
 nlp = None
 try:
@@ -56,6 +80,7 @@ def extract():
     """
     Extract structured fields from raw text (OCR/field report).
     Returns: location, category, urgency_keywords, severity, num_people, time_sensitive
+    Gemini enhancement is applied when available (falls back to regex/spaCy silently).
     """
     data = request.get_json()
     if not data or 'text' not in data:
@@ -79,6 +104,40 @@ def extract():
     # If no sections produced results, treat entire text as one
     if not results:
         results = [extract_from_section(text)]
+
+    # --- Gemini enhancement (best-effort, merges into base result) ---
+    if gemini:
+        try:
+            prompt = (
+                "You are a data extraction assistant for a community aid platform. "
+                "Extract structured information from the following field report text. "
+                "Reply ONLY with a valid JSON object (no markdown fences) containing these fields: "
+                "location (string or null), "
+                "category (one of: education, medical, water, food, shelter, plumbing, other), "
+                "severity (integer 1-5), "
+                "num_people (integer or null), "
+                "time_sensitive (boolean), "
+                "title (concise string), "
+                "description (1-2 sentence summary). "
+                "Text:\n" + text
+            )
+            response = gemini.generate_content(prompt)
+            raw = response.text.strip()
+            # Strip markdown code fences if model wraps in them
+            if raw.startswith("```"):
+                raw = re.sub(r'^```[a-z]*\n?', '', raw)
+                raw = re.sub(r'\n?```$', '', raw).strip()
+            gemini_data = json.loads(raw)
+
+            # Merge: Gemini fields take priority; existing values fill any gaps
+            base = results[0] if len(results) == 1 else results
+            if isinstance(base, dict):
+                for key, val in gemini_data.items():
+                    if val is not None:
+                        base[key] = val
+                results = [base]
+        except Exception as _gem_err:
+            print(f"⚠️ Gemini extraction failed (using regex fallback): {_gem_err}")
 
     return jsonify(results if len(results) > 1 else results[0])
 
@@ -172,7 +231,7 @@ def match_score():
     """
     Compute match score between a need and volunteer.
     Input: need JSON + volunteer JSON
-    Output: match_score (0-1)
+    Output: match_score (0-1), explanation (string or null when Gemini unavailable)
     """
     data = request.get_json()
     if not data or 'need' not in data or 'volunteer' not in data:
@@ -204,6 +263,7 @@ def match_score():
     if skill_match == 0 or distance > max_radius:
         return jsonify({
             'match_score': 0,
+            'explanation': None,
             'distance_km': round(distance, 2),
             'breakdown': {'skill': 0, 'distance': 0, 'availability': 0, 'trust': 0}
         })
@@ -218,8 +278,27 @@ def match_score():
     # Weighted score
     score = skill_match * 0.4 + distance_score * 0.3 + availability_score * 0.2 + trust * 0.1
 
+    # --- Gemini explanation (best-effort) ---
+    explanation = None
+    if gemini:
+        try:
+            prompt = (
+                f"In one concise sentence, explain why this volunteer is a "
+                f"{round(score * 100)}% match for this need. "
+                f"Need category: {need.get('category', 'unknown')}, "
+                f"location: {need.get('location', 'unknown')}. "
+                f"Volunteer skills: {vol_skills}, "
+                f"distance: {round(distance, 1)} km, "
+                f"trust score: {round(trust * 100)}%. "
+                "Be specific and encouraging."
+            )
+            explanation = gemini.generate_content(prompt).text.strip()
+        except Exception as _gem_err:
+            print(f"⚠️ Gemini explanation failed: {_gem_err}")
+
     return jsonify({
         'match_score': round(score, 3),
+        'explanation': explanation,
         'distance_km': round(distance, 2),
         'breakdown': {
             'skill': round(skill_match, 2),
@@ -350,7 +429,7 @@ def check_availability_overlap(need, availability):
 
     from datetime import datetime
     days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
-    
+
     created = need.get('created_at')
     if created:
         try:
@@ -358,7 +437,7 @@ def check_availability_overlap(need, availability):
                 dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
             else:
                 dt = datetime.now()
-        except:
+        except Exception:
             dt = datetime.now()
     else:
         dt = datetime.now()
@@ -376,6 +455,63 @@ def check_availability_overlap(need, availability):
 
 
 # ==========================================
+# CHAT ENDPOINT (Gemini-powered volunteer assistant)
+# ==========================================
+
+CHAT_SYSTEM_PROMPT = (
+    "You are a helpful assistant for the Community Aid Platform, a volunteer-need matching system. "
+    "You help volunteers understand open needs, navigate the platform, find suitable tasks, and "
+    "coordinate with organisations. Be concise, empathetic, and practical. "
+    "If asked about specific data you don't have access to, suggest the volunteer check their dashboard."
+)
+
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    Volunteer-facing chatbot powered by Gemini.
+    Input:  { user_id, message, context: { open_needs_count, role } }
+    Output: { reply } or { error } (503 if Gemini is not configured)
+    """
+    if not gemini:
+        return jsonify({'error': 'Gemini AI is not configured. Please set GEMINI_API_KEY.'}), 503
+
+    data = request.get_json()
+    if not data or 'message' not in data:
+        return jsonify({'error': 'message is required'}), 400
+
+    user_id = data.get('user_id', 'anonymous')
+    message = data['message']
+    context = data.get('context', {})
+
+    open_needs = context.get('open_needs_count', 'unknown')
+    role = context.get('role', 'volunteer')
+
+    # Build or retrieve persistent in-memory session
+    if user_id not in chat_sessions:
+        system_with_context = (
+            f"{CHAT_SYSTEM_PROMPT}\n\n"
+            f"Current platform context: There are currently {open_needs} open needs. "
+            f"The user's role is: {role}."
+        )
+        chat_sessions[user_id] = gemini.start_chat(history=[
+            {'role': 'user', 'parts': [system_with_context]},
+            {'role': 'model', 'parts': [
+                "Understood. I'm ready to help volunteers on the Community Aid Platform."
+            ]},
+        ])
+
+    try:
+        response = chat_sessions[user_id].send_message(message)
+        return jsonify({'reply': response.text.strip()})
+    except Exception as e:
+        # Reset broken session so next request starts fresh
+        chat_sessions.pop(user_id, None)
+        print(f"⚠️ Chat session error for {user_id}: {e}")
+        return jsonify({'error': 'Chat service temporarily unavailable. Please try again.'}), 503
+
+
+# ==========================================
 # HEALTH CHECK
 # ==========================================
 
@@ -385,6 +521,7 @@ def health():
         'status': 'ok',
         'spacy_loaded': nlp is not None,
         'sklearn_available': dbscan_available,
+        'gemini_available': gemini is not None,
     })
 
 
